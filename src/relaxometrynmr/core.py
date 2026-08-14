@@ -1,3 +1,4 @@
+import os
 import nmrglue as ng
 import numpy as np
 import pandas as pd
@@ -90,6 +91,131 @@ class T1Functions:
                 continue
 
         return spectra_1d, vd_list, csdm_ds
+
+    def _is_pdata_path(self, path):
+        """
+        Determine whether `path` points to Bruker processed data (pdata)
+        rather than a raw experiment directory containing fid/ser.
+
+        Returns True if `path` itself is a procno folder (contains 1r/2rr),
+        or if it is an experiment folder that only exposes a pdata subfolder
+        and no raw fid/ser file.
+        """
+        if os.path.isfile(os.path.join(path, "1r")) or os.path.isfile(os.path.join(path, "2rr")):
+            return True
+
+        has_raw = os.path.isfile(os.path.join(path, "fid")) or os.path.isfile(os.path.join(path, "ser"))
+        if has_raw:
+            return False
+
+        return os.path.isdir(os.path.join(path, "pdata"))
+
+    def _resolve_pdata_path(self, proc_no=1):
+        """
+        Resolve `self.file_path` to a concrete pdata/<proc_no> directory,
+        whether `self.file_path` already points at that directory or at
+        the experiment root above it.
+        """
+        path = self.file_path.rstrip("/\\")
+
+        if os.path.isfile(os.path.join(path, "1r")) or os.path.isfile(os.path.join(path, "2rr")):
+            return path
+
+        return os.path.join(path, "pdata", str(proc_no))
+
+    def _experiment_root(self, pdata_path):
+        """Given a .../<expno>/pdata/<procno> path, return the <expno> directory."""
+        return os.path.dirname(os.path.dirname(pdata_path.rstrip("/\\")))
+
+    def read_processed_bruker_data(self, proc_no=1):
+        """
+        Read a pseudo-2D relaxation series directly from Bruker processed
+        data (pdata) instead of the raw FID/SER file.
+
+        This is needed when only processed data is available (e.g. data
+        acquired on instruments/setups where the raw time-domain data was
+        not exported or is inaccessible), such as relaxation series recorded
+        at Warwick. Because Bruker's automatic processing (phasing, etc.) is
+        not always well optimized, the returned spectra are frequency-domain
+        and complex, so they can still be run through
+        `zero_order_phasing`/`first_order_phasing` for manual correction.
+
+        Args:
+            proc_no (int): Processing number to read, i.e. the pdata/<proc_no>
+                            subfolder. Defaults to 1.
+
+        Returns:
+            tuple: (spectra, vd_list, ppm, dic)
+                - spectra: list of 1D complex frequency-domain spectra, one
+                  per point in the pseudo-2D series
+                - vd_list: variable delay list (T1 relaxation time points)
+                - ppm: ppm scale shared by all spectra
+                - dic: Bruker parameter dictionary for the processed dataset
+
+        Raises:
+            FileNotFoundError: If no vdlist, vplist, or vclist file is found
+                                in the experiment directory.
+        """
+        pdata_path = self._resolve_pdata_path(proc_no)
+
+        dic, data = ng.bruker.read_pdata(pdata_path)
+        udic = ng.bruker.guess_udic(dic, data)
+        uc = ng.fileiobase.uc_from_udic(udic, dim=1)
+        ppm = uc.ppm_scale()
+
+        exp_root = self._experiment_root(pdata_path)
+        possible_files = ["vdlist", "vplist", "vclist"]
+        vd_list = None
+        for filename in possible_files:
+            try:
+                vd_list = np.loadtxt(os.path.join(exp_root, filename))
+                break
+            except OSError:
+                continue
+        if vd_list is None:
+            raise FileNotFoundError("No vdlist, vplist, or vclist file found.")
+
+        spectra = [np.asarray(point) for point in data]
+
+        return spectra, vd_list, ppm, dic
+
+    def load_relaxation_series(self, proc_no=1, save_nmrpipe=True):
+        """
+        Load a pseudo-2D relaxation series, auto-detecting whether
+        `self.file_path` points to raw Bruker data (fid/ser) or to
+        processed data (pdata) and dispatching accordingly.
+
+        Use this as the single entry point when it is unknown in advance
+        (e.g. datasets pooled from multiple instruments/sites) whether raw
+        FIDs will be available. Raw data goes through the standard
+        `read_and_convert_bruker_data` pipeline (apodization, zero-filling,
+        FFT, phasing). Processed data goes through
+        `read_processed_bruker_data`, skipping the FFT step since Bruker
+        has already performed it; only phase correction is typically still
+        needed there.
+
+        Args:
+            proc_no (int): pdata processing number to use if processed data
+                            is detected. Ignored for raw data.
+            save_nmrpipe (bool): Whether to save NMRPipe output if raw data
+                                  is detected. Ignored for processed data.
+
+        Returns:
+            tuple: (source, spectra, vd_list, extra)
+                - source (str): "raw" or "processed", indicating which path
+                  was taken
+                - spectra: list of 1D spectra (CSDM datasets for "raw",
+                  complex ndarrays for "processed")
+                - vd_list: variable delay list
+                - extra: the CSDM dataset for "raw", or (ppm, dic) for
+                  "processed"
+        """
+        if self._is_pdata_path(self.file_path):
+            spectra, vd_list, ppm, dic = self.read_processed_bruker_data(proc_no=proc_no)
+            return "processed", spectra, vd_list, (ppm, dic)
+
+        spectra_1d, vd_list, csdm_ds = self.read_and_convert_bruker_data(save_nmrpipe=save_nmrpipe)
+        return "raw", spectra_1d, vd_list, csdm_ds
 
     def zero_fill(self, data, new_len):
         """

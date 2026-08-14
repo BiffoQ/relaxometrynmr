@@ -205,6 +205,95 @@ class TestT1Functions(unittest.TestCase):
         self.assertTrue(os.path.exists(prefix + 'fitted_fwhm_params.csv'))
         self.assertTrue(os.path.exists(prefix + 'sample.csv'))
 
+    def test_is_pdata_path_raw_experiment(self):
+        """A folder with a raw fid/ser file should be detected as raw, not pdata."""
+        open(os.path.join(self.temp_dir, 'fid'), 'a').close()
+        self.assertFalse(self.t1_funcs._is_pdata_path(self.temp_dir))
+
+    def test_is_pdata_path_procno_dir(self):
+        """A folder containing 1r (or 2rr) should be detected as a pdata procno dir."""
+        open(os.path.join(self.temp_dir, '1r'), 'a').close()
+        self.assertTrue(self.t1_funcs._is_pdata_path(self.temp_dir))
+
+    def test_is_pdata_path_experiment_with_pdata_subfolder(self):
+        """An experiment root with only a pdata subfolder (no fid/ser) is pdata-only."""
+        os.makedirs(os.path.join(self.temp_dir, 'pdata', '1'))
+        self.assertTrue(self.t1_funcs._is_pdata_path(self.temp_dir))
+
+    def test_resolve_pdata_path_from_procno_dir(self):
+        """Resolving a path that already points at a procno dir returns it unchanged."""
+        open(os.path.join(self.temp_dir, '1r'), 'a').close()
+        with patch.object(self.t1_funcs, 'file_path', self.temp_dir):
+            resolved = self.t1_funcs._resolve_pdata_path(proc_no=1)
+        self.assertEqual(resolved, self.temp_dir)
+
+    def test_resolve_pdata_path_from_experiment_root(self):
+        """Resolving an experiment root appends pdata/<proc_no>."""
+        with patch.object(self.t1_funcs, 'file_path', self.temp_dir):
+            resolved = self.t1_funcs._resolve_pdata_path(proc_no=1)
+        self.assertEqual(resolved, os.path.join(self.temp_dir, 'pdata', '1'))
+
+    @patch('nmrglue.bruker.read_pdata')
+    @patch('nmrglue.bruker.guess_udic')
+    def test_read_processed_bruker_data(self, mock_guess_udic, mock_read_pdata):
+        """Test reading processed (pdata) Bruker data directly."""
+        mock_udic = {
+            "ndim": 2,
+            0: {
+                "encoding": "states", "sw": 50000, "obs": 400, "car": 100.0,
+                "size": 6, "label": "F1", "complex": False, "time": True, "freq": False
+            },
+            1: {
+                "encoding": "states", "sw": 50000, "obs": 400, "car": 100.0,
+                "size": 1024, "label": "F2", "complex": True, "time": False, "freq": True
+            }
+        }
+        mock_dic = {"ndim": 2}
+        mock_data = np.zeros((6, 1024), dtype=np.complex128)
+
+        mock_read_pdata.return_value = (mock_dic, mock_data)
+        mock_guess_udic.return_value = mock_udic
+
+        pdata_dir = os.path.join(self.temp_dir, 'pdata', '1')
+        os.makedirs(pdata_dir)
+        open(os.path.join(pdata_dir, '1r'), 'a').close()
+
+        vdlist_path = os.path.join(self.temp_dir, "vdlist")
+        np.savetxt(vdlist_path, self.mock_vd_list)
+
+        with patch.object(self.t1_funcs, 'file_path', self.temp_dir):
+            spectra, vd_list, ppm, dic = self.t1_funcs.read_processed_bruker_data(proc_no=1)
+
+        self.assertEqual(len(spectra), 6)
+        self.assertIsInstance(vd_list, np.ndarray)
+        self.assertTrue(np.allclose(vd_list, self.mock_vd_list))
+        self.assertEqual(len(ppm), 1024)
+        self.assertEqual(dic, mock_dic)
+
+    def test_load_relaxation_series_dispatches_to_processed(self):
+        """load_relaxation_series should route pdata-only folders to read_processed_bruker_data."""
+        os.makedirs(os.path.join(self.temp_dir, 'pdata', '1'))
+
+        with patch.object(self.t1_funcs, 'read_processed_bruker_data') as mock_read_processed:
+            mock_read_processed.return_value = ([self.mock_spectrum], self.mock_vd_list, np.arange(1024), {})
+            source, spectra, vd_list, extra = self.t1_funcs.load_relaxation_series()
+
+        self.assertEqual(source, "processed")
+        mock_read_processed.assert_called_once()
+        self.assertTrue(np.allclose(vd_list, self.mock_vd_list))
+
+    def test_load_relaxation_series_dispatches_to_raw(self):
+        """load_relaxation_series should route raw fid/ser folders to read_and_convert_bruker_data."""
+        open(os.path.join(self.temp_dir, 'fid'), 'a').close()
+
+        with patch.object(self.t1_funcs, 'read_and_convert_bruker_data') as mock_read_raw:
+            mock_read_raw.return_value = ([self.mock_spectrum], self.mock_vd_list, MagicMock())
+            source, spectra, vd_list, extra = self.t1_funcs.load_relaxation_series(save_nmrpipe=False)
+
+        self.assertEqual(source, "raw")
+        mock_read_raw.assert_called_once_with(save_nmrpipe=False)
+        self.assertTrue(np.allclose(vd_list, self.mock_vd_list))
+
     def test_mono_satrec_func(self):
         """Test mono-exponential saturation recovery function."""
         t = np.linspace(0, 20, 1000)
