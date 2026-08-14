@@ -183,6 +183,28 @@ class TestT1Functions(unittest.TestCase):
         )
         self.assertEqual(len(intensities), 2)
         
+    def test_lorentzian_fit(self):
+        """Test Lorentzian fitting functionality."""
+        x = np.linspace(-30, 30, 300)
+        A_true, x0_true, gamma_true, offset_true = 50.0, 2.0, 5.0, 1.0
+        y = (A_true / np.pi) * (gamma_true / (gamma_true**2 + (x - x0_true)**2)) + offset_true
+
+        prefix = self.temp_dir + os.path.sep
+        result = self.t1_funcs.lorentzian_fit(
+            'sample', x, y,
+            plot_filepath=prefix, params_filepath=prefix, data_filepath=prefix
+        )
+
+        self.assertAlmostEqual(result['A'], A_true, places=2)
+        self.assertAlmostEqual(result['x0'], x0_true, places=2)
+        self.assertAlmostEqual(result['gamma'], gamma_true, places=2)
+        self.assertAlmostEqual(result['offset'], offset_true, places=2)
+        self.assertAlmostEqual(result['fwhm_hz'], gamma_true * 67.8 * 2, places=1)
+
+        self.assertTrue(os.path.exists(prefix + 'lorentzian_fit.svg'))
+        self.assertTrue(os.path.exists(prefix + 'fitted_fwhm_params.csv'))
+        self.assertTrue(os.path.exists(prefix + 'sample.csv'))
+
     def test_mono_satrec_func(self):
         """Test mono-exponential saturation recovery function."""
         t = np.linspace(0, 20, 1000)
