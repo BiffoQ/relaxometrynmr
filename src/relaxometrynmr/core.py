@@ -7,14 +7,16 @@ from mrsimulator import signal_processor as sp
 from scipy.optimize import curve_fit
 from scipy.integrate import simpson, trapezoid
 from scipy.ndimage import gaussian_filter1d
+from scipy.signal import fftconvolve
 import matplotlib.pyplot as plt
 
 
 def _parse_fwhm_hz(fwhm):
     """
-    Parse a Gaussian FWHM into a plain float in Hz. Accepts the same inputs
-    `process_spectrum`'s mrsimulator apodization accepts (a bare number, or a
-    string like `'200 Hz'`/`'1.2 kHz'`); 0/None/'' means no broadening.
+    Parse a line-broadening FWHM into a plain float in Hz. Accepts the same
+    inputs `process_spectrum`'s mrsimulator apodization accepts (a bare
+    number, or a string like `'200 Hz'`/`'1.2 kHz'`); 0/None/'' means no
+    broadening.
     """
     if fwhm in (None, "", 0):
         return 0.0
@@ -22,6 +24,20 @@ def _parse_fwhm_hz(fwhm):
         return float(fwhm)
     from astropy import units as u
     return float(u.Quantity(fwhm).to(u.Hz).value)
+
+
+def _lorentzian_kernel(n_points, gamma_points):
+    """
+    Normalized (unit-area) discrete Lorentzian convolution kernel of the
+    given HWHM (`gamma_points`, in samples), centered on `n_points`
+    samples. Convolving a spectrum with this is the frequency-domain
+    equivalent of multiplying its (unavailable, already-FFT'd) FID by an
+    exponential decay window - the same relationship `gaussian_filter1d`
+    exploits for the Gaussian case in `process_processed_spectrum`.
+    """
+    n = np.arange(n_points) - n_points // 2
+    kernel = gamma_points / (np.pi * (n ** 2 + gamma_points ** 2))
+    return kernel / kernel.sum()
 
 
 class _Coordinates:
@@ -303,7 +319,7 @@ class T1Functions:
         spectra_1d, vd_list, csdm_ds = self.read_and_convert_bruker_data(save_nmrpipe=save_nmrpipe)
         return "raw", spectra_1d, vd_list, csdm_ds
 
-    def process_processed_spectrum(self, spectrum, ppm, sw, fwhm, ph0, ph1):
+    def process_processed_spectrum(self, spectrum, ppm, sw, fwhm, ph0, ph1, window_type='gaussian'):
         """
         Phase-correct (and optionally line-broaden) a spectrum read from
         Bruker processed data (pdata).
@@ -311,16 +327,19 @@ class T1Functions:
         Unlike `process_spectrum`, no zero-filling or FFT is applied here:
         Bruker's own processing already performed that step, and there is no
         time-domain FID left to re-apodize the same way. If `fwhm` is
-        nonzero, extra Gaussian broadening is instead applied directly in the
-        frequency domain as a Gaussian convolution - by the Fourier
-        convolution theorem this is equivalent to multiplying the
-        (unavailable) FID by the same Gaussian window `process_spectrum`
-        uses, without needing to reconstruct a pseudo-FID via inverse FFT.
-        The result exposes the same `dimensions[0].coordinates.value` /
-        `dependent_variables[0].components[0]` interface as
-        `process_spectrum`'s CSDM output, so processed and raw spectra can be
-        passed to `integrate_spectrum_region` and other downstream code
-        interchangeably.
+        nonzero, extra broadening is instead applied directly in the
+        frequency domain as a convolution - by the Fourier convolution
+        theorem this is equivalent to multiplying the (unavailable) FID by
+        the same window `process_spectrum` uses, without needing to
+        reconstruct a pseudo-FID via inverse FFT. `window_type='gaussian'`
+        convolves with a Gaussian (matches Gaussian multiplication of the
+        FID); `window_type='lorentzian'` convolves with a Lorentzian
+        (matches exponential multiplication of the FID, i.e. classic
+        Lorentzian line broadening). The result exposes the same
+        `dimensions[0].coordinates.value` / `dependent_variables[0].components[0]`
+        interface as `process_spectrum`'s CSDM output, so processed and raw
+        spectra can be passed to `integrate_spectrum_region` and other
+        downstream code interchangeably.
 
         Args:
             spectrum (ndarray): Complex frequency-domain spectrum, as returned
@@ -330,10 +349,12 @@ class T1Functions:
             sw (float): Spectral width (Hz) of the direct dimension, returned
                 alongside `ppm`; used to convert `fwhm` into an equivalent
                 smoothing width in points.
-            fwhm (float or str): Extra Gaussian line broadening to apply,
-                e.g. `200` or `'200 Hz'`. 0 (or falsy) applies none.
+            fwhm (float or str): Extra line broadening to apply, e.g. `200`
+                or `'200 Hz'`. 0 (or falsy) applies none.
             ph0 (float): Zero-order phase correction in degrees.
             ph1 (float): First-order phase correction factor.
+            window_type (str): 'gaussian' or 'lorentzian' - which window
+                function's frequency-domain equivalent to apply.
 
         Returns:
             _PhasedSpectrum: phase-corrected (and optionally broadened) spectrum.
@@ -341,11 +362,19 @@ class T1Functions:
         fwhm_hz = _parse_fwhm_hz(fwhm)
         if fwhm_hz > 0:
             hz_per_point = sw / spectrum.shape[0]
-            sigma_points = (fwhm_hz / hz_per_point) / 2.354820045030949
-            spectrum = (
-                gaussian_filter1d(spectrum.real, sigma_points)
-                + 1j * gaussian_filter1d(spectrum.imag, sigma_points)
-            )
+            if window_type == 'lorentzian':
+                gamma_points = (fwhm_hz / hz_per_point) / 2.0
+                kernel = _lorentzian_kernel(spectrum.shape[0], gamma_points)
+                spectrum = (
+                    fftconvolve(spectrum.real, kernel, mode='same')
+                    + 1j * fftconvolve(spectrum.imag, kernel, mode='same')
+                )
+            else:
+                sigma_points = (fwhm_hz / hz_per_point) / 2.354820045030949
+                spectrum = (
+                    gaussian_filter1d(spectrum.real, sigma_points)
+                    + 1j * gaussian_filter1d(spectrum.imag, sigma_points)
+                )
 
         phased = self.zero_order_phasing(spectrum, ph0)
         phased = self.first_order_phasing(phased, ph1)
@@ -435,32 +464,49 @@ class T1Functions:
 
         return phased_data
 
-    def process_spectrum(self, spectrum, fwhm, zero_fill_factor, ph0, ph1):
+    def process_spectrum(self, spectrum, fwhm, zero_fill_factor, ph0, ph1, window_type='gaussian'):
         """
         Process NMR spectrum with a comprehensive set of
         standard NMR data processing steps.
         This function applies, in order:
-        1. Gaussian apodization for line broadening and S/N improvement
+        1. Apodization (Gaussian or Lorentzian window) for line broadening
+           and S/N improvement
         2. Zero-filling for increased digital resolution
         3. Fourier transformation to convert from time to frequency domain
         4. Phase corrections (both zero- and first-order)
         5. Conversion to ppm scale for chemical shift referencing
 
+        Gaussian apodization (`window_type='gaussian'`) multiplies the FID by
+        a Gaussian decay - it has no long tail, so it improves resolution
+        (narrows lines, suppresses truncation wiggles) at some cost in S/N,
+        and does not distort an already-Lorentzian lineshape's tails. Best
+        for resolving overlapping/crowded peaks, e.g. many ssNMR spectra with
+        several close chemical environments.
+        Lorentzian (exponential) apodization (`window_type='lorentzian'`)
+        multiplies the FID by an exponential decay, matched to the natural
+        homogeneous linewidth (T2*-limited decay) - it maximizes
+        signal-to-noise for an already-Lorentzian peak (matched filter) but
+        broadens the line and adds Lorentzian tails. Best for boosting S/N on
+        well-resolved, individually narrow lines where extra resolution
+        isn't needed.
+
         Args:
             spectrum (ndarray): Input time-domain NMR spectrum (FID)
-            fwhm (float): Full width at half maximum for Gaussian apodization in Hz.
+            fwhm (float): Full width at half maximum for apodization in Hz.
                          Controls the trade-off between resolution and signal-to-noise
             zero_fill_factor (int): Factor for zero filling, typically 2-4 for moderate
                                    resolution enhancement
             ph0 (float): Zero-order phase correction in degrees
             ph1 (float): First-order phase correction factor
+            window_type (str): 'gaussian' (resolution-enhancing, default) or
+                         'lorentzian' (S/N-enhancing, matched filter)
 
         Returns:
             ndarray: Fully processed frequency-domain spectrum referenced to ppm scale
         """
         # Apply line broadening and Fourier transform
-
-        ft = sp.SignalProcessor(operations=[sp.apodization.Gaussian(FWHM=fwhm), sp.FFT()])
+        apodization = sp.apodization.Exponential(FWHM=fwhm) if window_type == 'lorentzian' else sp.apodization.Gaussian(FWHM=fwhm)
+        ft = sp.SignalProcessor(operations=[apodization, sp.FFT()])
 
         # Apply zero filling
         spectrum = self.zero_fill(spectrum, zero_fill_factor * spectrum.shape[0])
