@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "relaxometrynmr"
-version = "0.0.5"
+version = "0.0.6"
 description = "solid-state NMR relaxation data analysis: T1, T1_rho and T2"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -77,7 +77,7 @@ no_implicit_optional = false
 disable_error_code = "annotation-unchecked"
 
 [tool.hatch]
-version = "0.0.5"
+version = "0.0.6"
 envs = {dev = ["pytest", "black", "isort", "mypy"]}
 
 [tool.hatch.build.targets.wheel]

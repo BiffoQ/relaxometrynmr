@@ -249,9 +249,14 @@ class TestT1Functions(unittest.TestCase):
             }
         }
         mock_dic = {"ndim": 2}
-        mock_data = np.zeros((6, 1024), dtype=np.complex128)
+        # Two trailing rows are all-zero padded placeholders, as Bruker
+        # pseudo-2D pdata often has beyond the number of delays in vdlist.
+        mock_real = np.random.random((8, 1024))
+        mock_imag = np.random.random((8, 1024))
+        mock_real[6:] = 0
+        mock_imag[6:] = 0
 
-        mock_read_pdata.return_value = (mock_dic, mock_data)
+        mock_read_pdata.return_value = (mock_dic, (mock_real, mock_imag))
         mock_guess_udic.return_value = mock_udic
 
         pdata_dir = os.path.join(self.temp_dir, 'pdata', '1')
@@ -262,13 +267,13 @@ class TestT1Functions(unittest.TestCase):
         np.savetxt(vdlist_path, self.mock_vd_list)
 
         with patch.object(self.t1_funcs, 'file_path', self.temp_dir):
-            spectra, vd_list, ppm, dic = self.t1_funcs.read_processed_bruker_data(proc_no=1)
+            spectra, vd_list, ppm, sw = self.t1_funcs.read_processed_bruker_data(proc_no=1)
 
-        self.assertEqual(len(spectra), 6)
+        self.assertEqual(len(spectra), len(self.mock_vd_list))
         self.assertIsInstance(vd_list, np.ndarray)
         self.assertTrue(np.allclose(vd_list, self.mock_vd_list))
         self.assertEqual(len(ppm), 1024)
-        self.assertEqual(dic, mock_dic)
+        self.assertEqual(sw, 50000)
 
     def test_load_relaxation_series_dispatches_to_processed(self):
         """load_relaxation_series should route pdata-only folders to read_processed_bruker_data."""

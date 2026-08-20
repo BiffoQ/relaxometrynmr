@@ -1,11 +1,58 @@
 import os
+import warnings
 import nmrglue as ng
 import numpy as np
 import pandas as pd
 from mrsimulator import signal_processor as sp
 from scipy.optimize import curve_fit
 from scipy.integrate import simpson, trapezoid
+from scipy.ndimage import gaussian_filter1d
 import matplotlib.pyplot as plt
+
+
+def _parse_fwhm_hz(fwhm):
+    """
+    Parse a Gaussian FWHM into a plain float in Hz. Accepts the same inputs
+    `process_spectrum`'s mrsimulator apodization accepts (a bare number, or a
+    string like `'200 Hz'`/`'1.2 kHz'`); 0/None/'' means no broadening.
+    """
+    if fwhm in (None, "", 0):
+        return 0.0
+    if isinstance(fwhm, (int, float)):
+        return float(fwhm)
+    from astropy import units as u
+    return float(u.Quantity(fwhm).to(u.Hz).value)
+
+
+class _Coordinates:
+    def __init__(self, value):
+        self.value = value
+
+
+class _Dimension:
+    def __init__(self, value):
+        self.coordinates = _Coordinates(value)
+
+
+class _DependentVariable:
+    def __init__(self, data):
+        self.components = [data]
+
+
+class _PhasedSpectrum:
+    """
+    Minimal CSDM-like wrapper around an already Fourier-transformed spectrum
+    (e.g. Bruker pdata), exposing the same `.dimensions[0].coordinates.value`
+    / `.dependent_variables[0].components[0]` interface as a CSDM dataset.
+    This lets processed (pdata) and raw spectra flow through the same
+    downstream code (`integrate_spectrum_region`, plotting, API handlers)
+    without callers needing to special-case the source.
+    """
+
+    def __init__(self, ppm, data):
+        self.dimensions = [_Dimension(ppm)]
+        self.dependent_variables = [_DependentVariable(data)]
+
 
 class T1Functions:
 
@@ -90,6 +137,21 @@ class T1Functions:
                     raise FileNotFoundError("No vdlist, vplist, or vclist file found.")
                 continue
 
+        # Bruker's raw pseudo-2D acquisition dimension (TD1) can include a
+        # padded/extra plane, or the vdlist can be truncated relative to it,
+        # leaving spectra_1d and vd_list with different lengths. Truncate
+        # both to the shorter one so downstream code (e.g. /integrate) never
+        # indexes past the end of vd_list.
+        n = min(len(spectra_1d), len(vd_list))
+        if len(spectra_1d) != len(vd_list):
+            warnings.warn(
+                f"Number of spectra ({len(spectra_1d)}) does not match the "
+                f"length of the variable delay list ({len(vd_list)}); "
+                f"truncating both to {n}."
+            )
+            spectra_1d = spectra_1d[:n]
+            vd_list = vd_list[:n]
+
         return spectra_1d, vd_list, csdm_ds
 
     def _is_pdata_path(self, path):
@@ -127,7 +189,7 @@ class T1Functions:
         """Given a .../<expno>/pdata/<procno> path, return the <expno> directory."""
         return os.path.dirname(os.path.dirname(pdata_path.rstrip("/\\")))
 
-    def read_processed_bruker_data(self, proc_no=1):
+    def read_processed_bruker_data(self, proc_no=1, empty_atol=1e-10):
         """
         Read a pseudo-2D relaxation series directly from Bruker processed
         data (pdata) instead of the raw FID/SER file.
@@ -140,17 +202,31 @@ class T1Functions:
         and complex, so they can still be run through
         `zero_order_phasing`/`first_order_phasing` for manual correction.
 
+        Bruker pseudo-2D pdata arrays are frequently padded with trailing
+        placeholder rows (e.g. TD1 rounded up to a convenient size beyond the
+        number of delays actually listed in vdlist/vplist/vclist). Any row
+        whose real (…rr/…r) OR imaginary (…ii/…i) component is entirely zero
+        is treated as an empty placeholder and dropped, and the delay list is
+        truncated to match, so callers never see spectra with no signal and
+        no corresponding delay.
+
         Args:
             proc_no (int): Processing number to read, i.e. the pdata/<proc_no>
                             subfolder. Defaults to 1.
+            empty_atol (float): Absolute tolerance used to decide a component
+                                 is all-zero (and thus empty).
 
         Returns:
-            tuple: (spectra, vd_list, ppm, dic)
+            tuple: (spectra, vd_list, ppm, sw)
                 - spectra: list of 1D complex frequency-domain spectra, one
-                  per point in the pseudo-2D series
-                - vd_list: variable delay list (T1 relaxation time points)
+                  per non-empty point in the pseudo-2D series
+                - vd_list: variable delay list (T1 relaxation time points),
+                  truncated to match `spectra`
                 - ppm: ppm scale shared by all spectra
-                - dic: Bruker parameter dictionary for the processed dataset
+                - sw: spectral width (Hz) of the direct dimension, needed to
+                  convert a Gaussian FWHM (Hz) into an equivalent smoothing
+                  width when line-broadening these already Fourier-transformed
+                  spectra (see `process_processed_spectrum`)
 
         Raises:
             FileNotFoundError: If no vdlist, vplist, or vclist file is found
@@ -158,10 +234,11 @@ class T1Functions:
         """
         pdata_path = self._resolve_pdata_path(proc_no)
 
-        dic, data = ng.bruker.read_pdata(pdata_path)
-        udic = ng.bruker.guess_udic(dic, data)
+        dic, (real, imag) = ng.bruker.read_pdata(pdata_path, all_components=True)
+        udic = ng.bruker.guess_udic(dic, real)
         uc = ng.fileiobase.uc_from_udic(udic, dim=1)
         ppm = uc.ppm_scale()
+        sw = udic[1]["sw"]
 
         exp_root = self._experiment_root(pdata_path)
         possible_files = ["vdlist", "vplist", "vclist"]
@@ -174,10 +251,19 @@ class T1Functions:
                 continue
         if vd_list is None:
             raise FileNotFoundError("No vdlist, vplist, or vclist file found.")
+        vd_list = np.atleast_1d(vd_list)
 
-        spectra = [np.asarray(point) for point in data]
+        non_empty = ~(
+            np.all(np.isclose(real, 0, atol=empty_atol), axis=-1)
+            | np.all(np.isclose(imag, 0, atol=empty_atol), axis=-1)
+        )
+        real, imag = real[non_empty], imag[non_empty]
 
-        return spectra, vd_list, ppm, dic
+        n = min(real.shape[0], vd_list.shape[0])
+        spectra = [real[i] + 1j * imag[i] for i in range(n)]
+        vd_list = vd_list[:n]
+
+        return spectra, vd_list, ppm, sw
 
     def load_relaxation_series(self, proc_no=1, save_nmrpipe=True):
         """
@@ -207,15 +293,63 @@ class T1Functions:
                 - spectra: list of 1D spectra (CSDM datasets for "raw",
                   complex ndarrays for "processed")
                 - vd_list: variable delay list
-                - extra: the CSDM dataset for "raw", or (ppm, dic) for
+                - extra: the CSDM dataset for "raw", or (ppm, sw) for
                   "processed"
         """
         if self._is_pdata_path(self.file_path):
-            spectra, vd_list, ppm, dic = self.read_processed_bruker_data(proc_no=proc_no)
-            return "processed", spectra, vd_list, (ppm, dic)
+            spectra, vd_list, ppm, sw = self.read_processed_bruker_data(proc_no=proc_no)
+            return "processed", spectra, vd_list, (ppm, sw)
 
         spectra_1d, vd_list, csdm_ds = self.read_and_convert_bruker_data(save_nmrpipe=save_nmrpipe)
         return "raw", spectra_1d, vd_list, csdm_ds
+
+    def process_processed_spectrum(self, spectrum, ppm, sw, fwhm, ph0, ph1):
+        """
+        Phase-correct (and optionally line-broaden) a spectrum read from
+        Bruker processed data (pdata).
+
+        Unlike `process_spectrum`, no zero-filling or FFT is applied here:
+        Bruker's own processing already performed that step, and there is no
+        time-domain FID left to re-apodize the same way. If `fwhm` is
+        nonzero, extra Gaussian broadening is instead applied directly in the
+        frequency domain as a Gaussian convolution - by the Fourier
+        convolution theorem this is equivalent to multiplying the
+        (unavailable) FID by the same Gaussian window `process_spectrum`
+        uses, without needing to reconstruct a pseudo-FID via inverse FFT.
+        The result exposes the same `dimensions[0].coordinates.value` /
+        `dependent_variables[0].components[0]` interface as
+        `process_spectrum`'s CSDM output, so processed and raw spectra can be
+        passed to `integrate_spectrum_region` and other downstream code
+        interchangeably.
+
+        Args:
+            spectrum (ndarray): Complex frequency-domain spectrum, as returned
+                by `read_processed_bruker_data` / `load_relaxation_series`.
+            ppm (ndarray): ppm scale shared by all spectra in the series,
+                returned alongside `spectrum` by the same call.
+            sw (float): Spectral width (Hz) of the direct dimension, returned
+                alongside `ppm`; used to convert `fwhm` into an equivalent
+                smoothing width in points.
+            fwhm (float or str): Extra Gaussian line broadening to apply,
+                e.g. `200` or `'200 Hz'`. 0 (or falsy) applies none.
+            ph0 (float): Zero-order phase correction in degrees.
+            ph1 (float): First-order phase correction factor.
+
+        Returns:
+            _PhasedSpectrum: phase-corrected (and optionally broadened) spectrum.
+        """
+        fwhm_hz = _parse_fwhm_hz(fwhm)
+        if fwhm_hz > 0:
+            hz_per_point = sw / spectrum.shape[0]
+            sigma_points = (fwhm_hz / hz_per_point) / 2.354820045030949
+            spectrum = (
+                gaussian_filter1d(spectrum.real, sigma_points)
+                + 1j * gaussian_filter1d(spectrum.imag, sigma_points)
+            )
+
+        phased = self.zero_order_phasing(spectrum, ph0)
+        phased = self.first_order_phasing(phased, ph1)
+        return _PhasedSpectrum(ppm, phased)
 
     def zero_fill(self, data, new_len):
         """
@@ -418,12 +552,21 @@ class T1Functions:
             # if i == 0:
             fig, ax = plt.subplots(1, 2, figsize=(9, 3.5), subplot_kw={"projection": "csdm"})
 
-            ax[0].plot(exp_spectrum.real)
+            # Read via the shared dimensions/dependent_variables interface (same
+            # one integrate_spectrum_region uses) rather than `.real`, so this
+            # works for both actual CSDM datasets and the lightweight
+            # _PhasedSpectrum wrapper used for processed (pdata) spectra.
+            x = exp_spectrum.dimensions[0].coordinates.value
+            y = exp_spectrum.dependent_variables[0].components[0].real
+
+            ax[0].plot(x, y)
             ax[0].set_title(f"Full Spectrum {i+1}")
+            ax[0].set_xlabel("ppm")
             ax[0].invert_xaxis()
-            ax[1].plot(exp_spectrum.real, label="real")
+            ax[1].plot(x, y, label="real")
             ax[1].fill_between(x_regions[i], y_regions[i], color='red', alpha=0.5)
             ax[1].set_title(f"Zoomed Spectrum {i+1}")
+            ax[1].set_xlabel("ppm")
             ax[1].invert_xaxis()
             ax[1].set_xlim(xlim1, xlim2) #make this modular by passing x_lim as a parameter
 
