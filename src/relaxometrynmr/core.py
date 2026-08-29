@@ -92,7 +92,7 @@ class T1Functions:
         """
         self.file_path = file_path
 
-    def read_and_convert_bruker_data(self, save_nmrpipe=True):
+    def read_and_convert_bruker_data(self, save_nmrpipe=True, remove_digital_filter=False):
 
         """
         Read and convert Bruker NMR data to NMRPipe and CSDM formats.
@@ -108,6 +108,14 @@ class T1Functions:
             NMRPipe format is widely used in the NMR community and
             can be processed with various
                                 third-party tools.
+            remove_digital_filter (bool): If True, strip Bruker's digital-filter
+                group delay from the raw FIDs (via nmrglue.bruker.remove_digital_filter,
+                using GRPDLY, or the DSPFVS/DECIM lookup table on older data) before
+                converting. This makes each FID start at true t=0, so the transformed
+                spectrum needs little or no first-order phase and has a flatter
+                baseline. Left False by default so existing analyses are unchanged -
+                the group delay otherwise shows up as a large linear phase the user
+                dials out with ph1 in `process_spectrum`.
 
         Returns:
             tuple: A tuple containing three elements:
@@ -123,6 +131,8 @@ class T1Functions:
         """
         # Read Bruker data
         dic, data = ng.bruker.read(self.file_path)
+        if remove_digital_filter:
+            data = ng.bruker.remove_digital_filter(dic, data)
         u = ng.bruker.guess_udic(dic, data)
 
         # Create the converter object and initialize with Bruker data
@@ -281,7 +291,7 @@ class T1Functions:
 
         return spectra, vd_list, ppm, sw
 
-    def load_relaxation_series(self, proc_no=1, save_nmrpipe=True):
+    def load_relaxation_series(self, proc_no=1, save_nmrpipe=True, remove_digital_filter=False):
         """
         Load a pseudo-2D relaxation series, auto-detecting whether
         `self.file_path` points to raw Bruker data (fid/ser) or to
@@ -301,6 +311,10 @@ class T1Functions:
                             is detected. Ignored for raw data.
             save_nmrpipe (bool): Whether to save NMRPipe output if raw data
                                   is detected. Ignored for processed data.
+            remove_digital_filter (bool): Strip Bruker's digital-filter group
+                delay from the raw FIDs before transforming (see
+                `read_and_convert_bruker_data`). Ignored for processed data,
+                where Bruker's own processing already removed it.
 
         Returns:
             tuple: (source, spectra, vd_list, extra)
@@ -316,7 +330,9 @@ class T1Functions:
             spectra, vd_list, ppm, sw = self.read_processed_bruker_data(proc_no=proc_no)
             return "processed", spectra, vd_list, (ppm, sw)
 
-        spectra_1d, vd_list, csdm_ds = self.read_and_convert_bruker_data(save_nmrpipe=save_nmrpipe)
+        spectra_1d, vd_list, csdm_ds = self.read_and_convert_bruker_data(
+            save_nmrpipe=save_nmrpipe, remove_digital_filter=remove_digital_filter
+        )
         return "raw", spectra_1d, vd_list, csdm_ds
 
     def process_processed_spectrum(self, spectrum, ppm, sw, fwhm, ph0, ph1, window_type='gaussian'):
